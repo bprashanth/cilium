@@ -155,7 +155,7 @@ func (epSync *EndpointSynchronizer) RunK8sCiliumEndpointSync(e *endpoint.Endpoin
 						// Backfill the CEP UID as we need to do if the CEP was
 						// created on an agent version that did not yet store the
 						// UID at CEP create time.
-						if err := updateCEPUID(scopedLog, e, localCEP); err != nil {
+						if err := updateCEPUID(scopedLog, e, localCEP, epSync.Clientset); err != nil {
 							scopedLog.WithError(err).Warn("could not take ownership of existing ciliumendpoint")
 							return err
 						}
@@ -228,7 +228,7 @@ func (epSync *EndpointSynchronizer) RunK8sCiliumEndpointSync(e *endpoint.Endpoin
 						// Backfill the CEP UID as we need to do if the CEP was
 						// created on an agent version that did not yet store the
 						// UID at CEP create time.
-						if err := updateCEPUID(scopedLog, e, localCEP); err != nil {
+						if err := updateCEPUID(scopedLog, e, localCEP, epSync.Clientset); err != nil {
 							scopedLog.WithError(err).Warn("could not take ownership of existing ciliumendpoint")
 							return err
 						}
@@ -334,28 +334,40 @@ func (epSync *EndpointSynchronizer) RunK8sCiliumEndpointSync(e *endpoint.Endpoin
 // that this is a temporary state where either the local/remote agent managing the CEP
 // is shutting down and will delete the CEP, or the CEP is stale and needs to be cleaned
 // up by the operator.
-func updateCEPUID(scopedLog *logrus.Entry, e *endpoint.Endpoint, localCEP *cilium_v2.CiliumEndpoint) error {
+func updateCEPUID(scopedLog *logrus.Entry, e *endpoint.Endpoint, localCEP *cilium_v2.CiliumEndpoint, k8sClient client.Clientset) error {
 	// It's possible we already own this CEP, as in the case of a restore after restart.
 	// If the Endpoint already owns the CEP (by holding the matching CEP UID reference) then we don't have to
 	// worry about other ownership checks.
 	//
-	// This will cover cases such as if the NodeIP changes (as with a reboot). In which case we can safely
-	// take ownership and overwrite the CEPs status.
+	// This will cover cases such as if the NodeIP changes (as with a reboot).
+	// In which case we can safely take ownership and overwrite the CEPs
+	// status. However if the cilium endpoints were previously checkpointed
+	// into tmpfs this check will fail and we will rely on the next check to
+	// prevent us from hijacking CEPs.
 	cepUID := e.GetCiliumEndpointUID()
 	if cepUID == localCEP.UID {
 		return nil
 	}
 
-	var nodeIP string
-	if netStatus := localCEP.Status.Networking; netStatus == nil {
-		return fmt.Errorf("endpoint sync cannot take ownership of CEP that has no nodeIP status")
-	} else {
-		nodeIP = netStatus.NodeIP
-	}
-
 	// We do not want to take ownership of CEPs created on other Nodes.
-	if nodeIP != node.GetCiliumEndpointNodeIP() {
-		return fmt.Errorf("endpoint sync cannot take ownership of CEP that is not local (%q)", nodeIP)
+	// However we can't directly compare the CEP node ip with the node, because
+	// the node ip can change, orphaning the CEP. So we retrieve the pod for
+	// the CEP and compare its node IP with that of the node. The kubelet on
+	// this node will update the pod object appropriately, allowing this check
+	// to eventually go through.
+	// The intent here is to check if a given pod is running on the same node
+	// this cilium is running on before taking over its CEP.
+
+	// TODO: What about ipv6?
+	// TODO: Compare node names instead?
+	// TODO: Find the pod using ownerRef on CEP?
+	pod, err := k8sClient.CoreV1().Pods(e.GetK8sNamespace()).Get(context.TODO(), e.GetK8sPodName(), meta_v1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to check CEP's pod's nodeIP: %v", err)
+	}
+	nodeIP := node.GetCiliumEndpointNodeIP()
+	if pod.Status.HostIP != nodeIP {
+		return fmt.Errorf("endpoint sync cannot take ownership of CEP that is not local, CEP's pod's hostIP %q, nodeIP %q)", pod.Status.HostIP, nodeIP)
 	}
 
 	// If the endpoint has a CEP UID, which does not match the current CEP, we cannot take

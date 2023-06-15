@@ -108,7 +108,8 @@ func Test_updateCEPUID(t *testing.T) {
 		} {
 			t.Run(name, func(t *testing.T) {
 				assert := assert.New(t)
-				err := updateCEPUID(logrus.StandardLogger().WithFields(logrus.Fields{}), test.ep, test.cep)
+				// TODO: update with fake client when approach is finalized.
+				err := updateCEPUID(logrus.StandardLogger().WithFields(logrus.Fields{}), test.ep, test.cep, nil)
 				if test.err == nil {
 					assert.NoError(err)
 				} else {
